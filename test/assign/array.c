@@ -10,3 +10,4 @@ void foo(int n, int m) {
 	int (*p3)()= p2;
 p3();
 }
+// 11 : plus

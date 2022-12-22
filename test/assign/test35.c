@@ -8,5 +8,5 @@ void foo() {
 	int (*p3)()= p2;
 p3();
 }
-
+// 9 : plus
 

@@ -21,8 +21,7 @@ void addRetValues(MaybeSet &returnPts, llvm::Value *ret_value,
     //
     // %p2.addr -> {minus}
     // %0 -> {%p2.addr}
-    for (auto *value : (*dfval)[ret_value]) {
-      MyAssert(llvm::isa<llvm::Function>(value), value, ret_value);
+    for (auto *value : dfval->GetMaybeSet(ret_value)) {
       addRetValues(returnPts, value, dfval);
     }
   }
