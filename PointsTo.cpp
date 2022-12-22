@@ -1,12 +1,12 @@
 #include "PointsTo.h"
+#include "MyAssert.h"
 
 // Placement(Load, Alloca) -> Value
-void addRetValues(PointsToSet &returnPts, llvm::Value *ret_value,
-                         PointsToInfo *dfval) {
+void addRetValues(MaybeSet &returnPts, llvm::Value *ret_value,
+                  PointsToInfo *dfval) {
   if (llvm::isa<llvm::Function>(ret_value)) {
     returnPts.insert(ret_value);
-  } else if (llvm::isa<llvm::LoadInst>(ret_value) ||
-             llvm::isa<llvm::AllocaInst>(ret_value)) {
+  } else {
     // Example 1
     // %retval = alloca void (...)*, align 8
     // ...
@@ -22,11 +22,8 @@ void addRetValues(PointsToSet &returnPts, llvm::Value *ret_value,
     // %p2.addr -> {minus}
     // %0 -> {%p2.addr}
     for (auto *value : (*dfval)[ret_value]) {
+      MyAssert(llvm::isa<llvm::Function>(value), value, ret_value);
       addRetValues(returnPts, value, dfval);
     }
-  } else {
-    llvm::errs() << "TODO! addRetValues\n";
-    ret_value->dump();
-    exit(-1);
   }
-}
+ }

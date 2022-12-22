@@ -81,5 +81,6 @@ int main(int argc, char **argv) {
   /// Your pass to print Function and Call Instructions
   //    Passes.add(new Liveness());
   Passes.add(new PointsTo());
-  Passes.run(*M.get());
+  Passes.run(*M.get()); 
+  // M->dump();
 }

@@ -9,7 +9,7 @@
 			"type": "cppdbg",
 			"request": "launch",
 			"program": "${workspaceFolder}/build/assignment3",
-			"args": ["${workspaceFolder}/test/mutable_args/test00.bc"],
+			"args": ["${workspaceFolder}/test/test00.bc"],
 			"stopAtEntry": false,
 			"cwd": "${workspaceFolder}",
 			"environment": [],

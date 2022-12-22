@@ -8,29 +8,28 @@
 #include <llvm/Support/raw_ostream.h>
 
 #include "Dataflow.h"
+#include "MyAssert.h"
 #include <unordered_map>
 #include <unordered_set>
-
-struct GetElementValue {
-  llvm::GetElementPtrInst *inst;
-};
-
-using PointsToSet = std::unordered_set<llvm::Value *>;
+using MaybeSet = std::unordered_set<llvm::Value *>;
 
 struct PointsToInfo;
 
-// Placement(Load, Alloca) -> Value
-void addRetValues(PointsToSet &returnPts, llvm::Value *ret_value,
+void addRetValues(MaybeSet &returnPts, llvm::Value *ret_value,
                   PointsToInfo *dfval);
 struct PointsToInfo {
 private:
-  using PtsMap = std::unordered_map<llvm::Value *, PointsToSet>;
-  PtsMap pointsToSets;
+  using VarMaybeSets = std::unordered_map<llvm::Value *, MaybeSet>;
+  VarMaybeSets pointsToSets;
 
 public:
+  bool operator==(const PointsToInfo &info) const {
+    return pointsToSets == info.pointsToSets;
+  }
   void UpdateExistingKey(PointsToInfo &other) {
     for (auto &[v, pts] : pointsToSets) {
       if (auto it = other.find(v); it != other.end()) {
+        pointsToSets[v].clear();
         for (auto *value : it->second) {
           addRetValues(pointsToSets[v], value, &other);
         }
@@ -45,25 +44,46 @@ public:
   decltype(pointsToSets.cend()) end() const { return pointsToSets.cend(); }
 
   auto find(llvm::Value *v) const -> decltype(pointsToSets.find(v)) {
-    assert(!llvm::isa<llvm::Function>(v));
+    MyAssert(!llvm::isa<llvm::Function>(v), v);
     if (llvm::GetElementPtrInst *inst =
             llvm::dyn_cast<llvm::GetElementPtrInst>(v)) {
-      return pointsToSets.find(inst->getPointerOperand());
+      auto f = pointsToSets.find(v);
+      MyAssert(f->second.size() <= 1, v);
+      return pointsToSets.find(*f->second.begin());
     }
     return pointsToSets.find(v);
   }
 
-  auto operator[](llvm::Value *v) -> decltype(pointsToSets[v]) {
-    assert(!llvm::isa<llvm::Function>(v));
-    if (llvm::GetElementPtrInst *inst =
-            llvm::dyn_cast<llvm::GetElementPtrInst>(v)) {
-      return pointsToSets[inst->getPointerOperand()];
+  void Store(llvm::Value *src, llvm::Value *tar) {
+    MaybeSet maybe_values;
+    if (llvm::isa<llvm::Function>(src) || llvm::isa<llvm::AllocaInst>(src) ||
+        llvm::isa<llvm::GetElementPtrInst>(src)) {
+      // src is a pointer
+      maybe_values = {src};
+    } else {
+      // src is a register
+      maybe_values = (*this)[src];
     }
-    return pointsToSets[v];
+
+    if (llvm::isa<llvm::LoadInst>(tar)) {
+      auto maybe_targets = (*this)[tar];
+      for (auto maybe_target : maybe_targets) {
+        (*this)[maybe_target] = maybe_values;
+      }
+    } else {
+      (*this)[tar] = maybe_values;
+    }
   }
 
-  bool operator==(const PointsToInfo &info) const {
-    return pointsToSets == info.pointsToSets;
+  auto operator[](llvm::Value *v) -> decltype(pointsToSets[v]) {
+    MyAssert(!llvm::isa<llvm::Function>(v), v);
+
+    if (llvm::GetElementPtrInst *inst =
+            llvm::dyn_cast<llvm::GetElementPtrInst>(v)) {
+      MyAssert(pointsToSets[v].size() <= 1, v);
+      return pointsToSets[*pointsToSets[v].begin()];
+    }
+    return pointsToSets[v];
   }
 };
 
@@ -84,7 +104,7 @@ inline llvm::raw_ostream &operator<<(llvm::raw_ostream &out,
 using CallOutputMap = std::map<unsigned int, std::unordered_set<std::string>>;
 class PointsToVisitor : public DataflowVisitor<struct PointsToInfo> {
 private:
-  PointsToSet returnPts;
+  MaybeSet returnPts;
   CallOutputMap &callOutput;
 
 public:
@@ -124,31 +144,21 @@ public:
       f->dump();
       DataflowResult<PointsToInfo>::Type result;
       PointsToVisitor visitor(callOutput);
-      auto initval = *dfval;
+      auto &initval = *dfval;
 
       // add Param -> Arg
       int i = 0;
       for (auto &arg : f->args()) {
         llvm::Value *param = callInst->getArgOperand(i);
-        arg.dump();
-        param->dump();
         if (!param->getType()->isIntegerTy() &&
             !param->getType()->isFloatingPointTy()) {
-          if (llvm::isa<llvm::Function>(param)) {
-            initval[&arg] = {param};
-          } else {
-            initval[&arg] = initval[param];
-          }
+          initval.Store(param, &arg);
         }
         ++i;
       }
       if (!f->empty()) {
-        llvm::errs() << initval;
         compForwardDataflow(f, &visitor, &result, initval);
-        auto &lastBB = f->getBasicBlockList().back();
-        auto &lastOut = result[&lastBB].second;
-        dfval->UpdateExistingKey(lastOut);
-        (*dfval)[callInst].merge(visitor.returnPts);
+        (*dfval)[callInst] = visitor.returnPts;
       }
     }
   }
@@ -188,63 +198,19 @@ public:
         return;
       }
       auto pointer_operand = inst->getOperand(0);
-      if (llvm::isa<llvm::AllocaInst>(pointer_operand)) {
-        // %1 = load i32 (...)**, i32 (...)*** %a_fptr, align 8, !dbg !23
-        // store i32 (...)* @minus, i32 (...)** %1, align 8, !dbg !25
-        //
-        // %1 -> {a_fptr}
-        (*dfval)[inst] = {pointer_operand};
-        // a_fptr -> {minus}
-      } else if (llvm::isa<llvm::LoadInst>(pointer_operand)) {
-        // int (*p2)(int, int);
-        // int (**p3)(int,int);
-        // ...
-        // p0 = plus, p1 = minus, p3 = &p0, p3 = &p1;
-        // p2 = *p3;
-        //
-        // %3 = load i32 (i32, i32)**, i32 (i32, i32)*** %p3, align 8, !dbg !27
-        // %4 = load i32 (i32, i32)*, i32 (i32, i32)** %3, align 8, !dbg !28
-        // store i32 (i32, i32)* %4, i32 (i32, i32)** %p2, align 8, !dbg !29
-        //
-        // p3 -> {p0, p1}
-        // %3 -> {p3}
-        // %4 -> {p0, p1}
-        auto pts = (*dfval)[pointer_operand]; // {p3}
-        decltype(pts) merged;
-        for (auto v : pts) {         // p3
-          merged.merge((*dfval)[v]); // pts(p3) = {p0, p1}
-        }
-        (*dfval)[inst] = merged;
-        // p2 -> {plus, minus}
-      } else if (auto *get_elemptr =
-                     llvm::dyn_cast<llvm::GetElementPtrInst>(pointer_operand)) {
-        // qq = PARR[0];
-        //
-        // %arrayidx1 = getelementptr inbounds [1 x i32 (i32, i32)*], [1 x i32
-        // (i32, i32)*]* %PAAR, i64 0, i64 0, !dbg !34
-
-        // %0 = load i32 (i32, i32)*, i32 (i32, i32)** %arrayidx1, align 8, !dbg
-        // !34
-
-        // store i32 (i32, i32)* %0, i32 (i32, i32)** %qq, align 8, !dbg !33 ret
-        // void, !dbg !35
-
-        // %0 -> pts(%PAAR)
-        get_elemptr->getPointerOperand()->dump();
-        (*dfval)[inst] = (*dfval)[get_elemptr->getPointerOperand()];
-        llvm::errs() << *dfval;
-      } else if (llvm::isa<llvm::CallInst>(pointer_operand)) {
-        llvm::errs() << "CALL\n";
-        inst->dump();
-        pointer_operand->dump();
-        exit(-1);
-      } else {
-        llvm::errs() << "UNKNOWN pointer_operand type\n";
-        inst->dump();
-        pointer_operand->dump();
-        exit(-1);
-      }
+      (*dfval)[inst] = (*dfval)[pointer_operand];
       return;
+    }
+
+    if (llvm::isa<llvm::BitCastInst>(inst)) {
+      (*dfval)[inst] = {inst->getOperand(0)};
+      return;
+    }
+
+    if (llvm::GetElementPtrInst *getelement =
+            llvm::dyn_cast<llvm::GetElementPtrInst>(inst)) {
+      llvm::Value *pointer_operand = getelement->getPointerOperand();
+      (*dfval).Store(pointer_operand, getelement);
     }
 
     if (llvm::StoreInst *store_inst = llvm::dyn_cast<llvm::StoreInst>(inst)) {
@@ -255,96 +221,8 @@ public:
         return;
       }
 
-      // set value_pts
-      std::unordered_set<llvm::Value *> value_pts;
-      if (llvm::isa<llvm::Function>(value_operand)) {
-        // %1 = load i32 (...)**, i32 (...)*** %a_fptr, align 8, !dbg !23
-        // store i32 (...)* @minus, i32 (...)** %1, align 8, !dbg !25
-        value_pts = {value_operand}; // {minus}
-      } else if (llvm::isa<llvm::LoadInst>(value_operand)) {
-        // %1 = load i32 (i32, i32)*, i32 (i32, i32)** %p1, align 8, !dbg !32
-        // %2 = load i32 (i32, i32)**, i32 (i32, i32)*** %p3, align 8, !dbg !33
-        // store i32 (i32, i32)* %1, i32 (i32, i32)** %2, align 8, !dbg !34
-        //
-        // %1 -> {p1}
-        value_pts = (*dfval)[value_operand]; // {p1}
-      } else if (llvm::isa<llvm::ConstantPointerNull>(value_operand)) {
-        return;
-      } else if (llvm::isa<llvm::Argument>(value_operand)) {
-        // %p2.addr = alloca void (...)*, align 8
-        // store void (...)* %p2, void (...)** %p2.addr, align 8
-        value_pts = (*dfval)[value_operand];
-      } else if (llvm::isa<llvm::BitCastInst>(value_operand)) {
-        // %0 = bitcast i8* %call to i32 (...)**, !dbg !22
-        // store i32 (...)** %0, i32 (...)*** %a_fptr, align 8, !dbg !20
-        value_pts = (*dfval)[value_operand];
-      } else if (llvm::isa<llvm::AllocaInst>(value_operand)) {
-        // struct fptr a_fptr;
-        // struct fsptr s_fptr;
-        // s_fptr.sptr=&a_fptr;
-        //
-        //  %a_fptr = alloca %struct.fptr, align 8
-        // %s_fptr = alloca %struct.fsptr, align 8
-
-        // %sptr = getelementptr inbounds %struct.fsptr, %struct.fsptr* %s_fptr,
-        // i32 0, i32 0, !dbg !26
-
-        // store %struct.fptr* %a_fptr, %struct.fptr** %sptr, align 8, !dbg !27
-        // s_fptr -> {a_fptr}
-        value_pts = {value_operand};
-      } else if (llvm::isa<llvm::CallInst>(value_operand)) {
-        value_pts = (*dfval)[value_operand]; // test18.c
-      } else {
-        llvm::errs() << "unimplemented value_operand\n";
-        inst->dump();
-        value_operand->dump();
-        value_operand->getType()->dump();
-        exit(-1);
-      }
-
-      if (llvm::isa<llvm::LoadInst>(store_inst->getPointerOperand())) {
-        // int (*p1)(int,int) = ...;
-        // int (**p3)(int,int) = ...;
-        // ...
-        // *p3 = p1;
-        //
-        // %1 = load i32 (i32, i32)*, i32 (i32, i32)** %p1, align 8, !dbg !32
-        // %2 = load i32 (i32, i32)**, i32 (i32, i32)*** %p3, align 8, !dbg !33
-        // store i32 (i32, i32)* %1, i32 (i32, i32)** %2, align 8, !dbg !34
-        const auto pts = (*dfval)[store_inst->getPointerOperand()];
-        for (auto v : pts) {
-          (*dfval)[v] = value_pts;
-        }
-      } else if (llvm::isa<llvm::AllocaInst>(store_inst->getPointerOperand())) {
-        // int (*p2)(int, int) = p1;
-        // %0 = load i32 (i32, i32)*, i32 (i32, i32)** %p1, align 8, !dbg !28
-        // store i32 (i32, i32)* %0, i32 (i32, i32)** %p2, align 8, !dbg !27
-        (*dfval)[store_inst->getPointerOperand()] = value_pts;
-      } else if (llvm::isa<llvm::GetElementPtrInst>(
-                     store_inst->getPointerOperand())) {
-        // field insensitive, same as AllocaInst
-
-        // fff.p66 = plus;
-        // %p66 = getelementptr inbounds %struct.FFF, %struct.FFF* %fff, i32 0,
-        // i32 0
-
-        // store i32 (i32, i32)* @plus, i32 (i32, i32)** %p66, align 8, !dbg
-        // !22
-        (*dfval)[store_inst->getPointerOperand()] = value_pts;
-      } else {
-        llvm::errs() << "UNKNOWN pointer Operand\n";
-        store_inst->dump();
-        store_inst->getPointerOperand()->dump();
-        value_operand->dump();
-        exit(-1);
-      }
-
+      dfval->Store(value_operand, store_inst->getPointerOperand());
       return;
-    }
-
-    if (llvm::BitCastInst *bitcast_inst =
-            llvm::dyn_cast<llvm::BitCastInst>(inst)) {
-      (*dfval)[inst] = (*dfval)[bitcast_inst->getOperand(0)];
     }
   }
 };
