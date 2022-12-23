@@ -21,7 +21,7 @@ void addRetValues(MaybeSet &returnPts, llvm::Value *ret_value,
 struct PointsToInfo {
 private:
   using StackFrame =
-      std::unordered_map<llvm::Value *, std::shared_ptr<MaybeSet>>;
+      std::unordered_map<llvm::Value *, std::unordered_set<std::shared_ptr<MaybeSet>>>;
   StackFrame pointsToSets;
   PointsToInfo *father;
 
@@ -31,8 +31,10 @@ public:
   PointsToInfo(const PointsToInfo &other) {
     father = other.father;
     for (auto &[v, maybe_set_ptr] : other) {
-      MaybeSet copy = *maybe_set_ptr;
-      pointsToSets[v] = std::make_shared<MaybeSet>(copy);
+      for (auto ptr : maybe_set_ptr) {
+      MaybeSet copy = *ptr;
+        pointsToSets[v].insert(std::make_shared<MaybeSet>(copy));
+      }
     }
   }
 
@@ -138,8 +140,10 @@ public:
     MyAssert(!llvm::isa<llvm::Function>(v), v);
     auto *p = const_cast<PointsToInfo *>(findPointsToInfo(this, v));
     if (p == nullptr) {
-      pointsToSets[v] = std::make_shared<MaybeSet>(maybe_set);
+      MyAssert(pointsToSets[v].empty());
+      pointsToSets[v].insert(std::make_shared<MaybeSet>(maybe_set));
     } else {
+      MyAssert(!pointsToSets[v].empty());
       *p->pointsToSets[v] = maybe_set;
     }
   }
