@@ -22,3 +22,5 @@ void moo() {
     clever(t_fptr.s3.s2.PTR);
 }
 
+// 5 : plus
+// 22 : clever

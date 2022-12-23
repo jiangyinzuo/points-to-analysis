@@ -29,3 +29,4 @@ void moo(int x) {
   clever(s2pointer)->FUNC();
     
 }
+// 29 : minus, plus, clever

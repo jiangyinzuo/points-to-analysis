@@ -15,3 +15,4 @@ void foo(int x) {
 	}
 	choose(p)();
 }
+// 16 : plus, minus, choose

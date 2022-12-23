@@ -22,5 +22,4 @@ void moo() {
     
 }
 
-// 47 : foo, clever
-// 48 : plus, minus
+// 21 : minus, clever

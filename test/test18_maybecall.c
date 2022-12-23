@@ -22,5 +22,4 @@ void moo(char c) {
     goo_ptr(plus, minus)();
 }
 
-// 30 : foo, clever
-// 31 : plus, minus
+// 22 : foo, clever, plus, minus
