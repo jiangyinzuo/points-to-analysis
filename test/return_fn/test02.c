@@ -11,3 +11,4 @@ void (*goo(
 void foo(int a) {
 	goo(plus, minus)();
 }
+// 12 : minus, goo

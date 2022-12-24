@@ -10,20 +10,26 @@
 #include "Dataflow.h"
 #include "MyAssert.h"
 #include <memory>
+#include <stack>
 #include <unordered_map>
 #include <unordered_set>
 
 // -------------------------------------------------------------------------------------------------
-// operand type    |  mem addr              |  register                      |   fn addr
+// operand type    |  stack mem addr        |  register                      |   fn addr
 // -------------------------------------------------------------------------------------------------
 // MaybeSet pts[v] |  memory                |  mem addr, register, fn addr   |   /
 // -------------------------------------------------------------------------------------------------
-// llvm::Value     |  AllocaInst, CallInst  |  LoadInst, GetElementPtrInst,  |   Function,
-//                 |                        |  BitCastInst                   |   ConstantPointerNull
+// llvm::Value     |  AllocaInst            |  LoadInst, GetElementPtrInst,  |   Function,
+//                 |                        |  BitCastInst, CallInst         |   ConstantPointerNull
 // -------------------------------------------------------------------------------------------------
+union Operand {
+  llvm::Value* v; // always > 0
+  long heap_addr; // always < 0
+};
 using MaybeSet = std::unordered_set<llvm::Value *>;
 enum class OperandType {
-  MemAddr,
+  StackMemAddr,
+  HeapMemAddr, // emulate malloc
   Register,
   FnAddr
 };
@@ -34,54 +40,76 @@ OperandType GetOperandType(llvm::Value *v);
 // pamam -> arg
 using ParamMap = std::unordered_map<llvm::Argument *, llvm::Value *>;
 
-struct PointsToInfo;
+using PointsToSet = std::unordered_map<llvm::Value *, MaybeSet>;
+using StackFrame = std::deque<PointsToSet>;
 
+struct PointsToInfo;
 void addRetValues(MaybeSet &returnPts, llvm::Value *ret_value, PointsToInfo *dfval);
+
 struct PointsToInfo {
-private:
-  using PointsToSet = std::unordered_map<llvm::Value *, MaybeSet>;
-  PointsToSet pointsToSets;
-  PointsToInfo *father;
 
 public:
-  PointsToInfo() : father(nullptr) {}
-  explicit PointsToInfo(PointsToInfo *father) : father(father) {}
+  StackFrame stackFrame;
+  PointsToInfo() : stackFrame() {}
+  explicit PointsToInfo(const StackFrame &stack_frame) : stackFrame(stack_frame) {}
+
+  // Inited by DataFlow
   PointsToInfo(const PointsToInfo &other) {
-    father = other.father;
-    pointsToSets = other.pointsToSets;
+    stackFrame = other.stackFrame;
+  }
+
+  void PushStackFrame() {
+    stackFrame.emplace_back();
+  }
+
+  void PopStackFrame() {
+    stackFrame.pop_back();
   }
 
   bool operator==(const PointsToInfo &other) const {
-    MyAssert(father == other.father);
-    return pointsToSets == other.pointsToSets;
-  }
-
-  decltype(pointsToSets.cbegin()) begin() const {
-    return pointsToSets.cbegin();
-  }
-
-  decltype(pointsToSets.cend()) end() const { return pointsToSets.cend(); }
-
-  auto find(llvm::Value *v) const -> decltype(pointsToSets.find(v)) {
-    MyAssert(!llvm::isa<llvm::Function>(v), v);
-    auto it = pointsToSets.find(v);
-    if (it == pointsToSets.end() && father != nullptr) {
-      auto father_it = father->find(v);
-      if (father_it == father->end()) {
-        return it;
-      } else {
-        return father_it;
-      }
-    } else {
-      return it;
+    if (stackFrame.size() != other.stackFrame.size()) {
+      return false;
     }
+    for (int i = 0; i < stackFrame.size(); ++i) {
+      if (stackFrame[i] != other.stackFrame[i]) {
+        return false;
+      }
+    }
+    return true;
   }
 
+  const PointsToSet &pointsToSets() const {
+    return stackFrame.back();
+  }
+
+  auto end() const { return pointsToSets().cend(); }
+
+  auto find(llvm::Value *v) const {
+    MyAssert(!llvm::isa<llvm::Function>(v), v);
+    for (const auto &pts : stackFrame) {
+      if (auto it = pts.find(v); it != pts.end()) {
+        return it;
+      }
+    }
+    return pointsToSets().end();
+  }
+
+  MaybeSet GetMaybeRetValue(llvm::Value *v) {
+    switch (GetOperandType(v)) {
+    case OperandType::FnAddr:
+      return {v};
+    case OperandType::StackMemAddr:
+      MyAssert(false, v);
+    case OperandType::Register:
+      return GetMaybeSet(v);
+    }
+    return {};
+  }
   MaybeSet GetMaybeAddr(llvm::Value *v) {
     switch (GetOperandType(v)) {
     case OperandType::FnAddr:
       MyAssert(false, v);
-    case OperandType::MemAddr:
+    case OperandType::StackMemAddr:
       return {v};
     case OperandType::Register:
       return GetMaybeSet(v);
@@ -95,7 +123,7 @@ public:
     case OperandType::FnAddr:
       maybe_set = {operand};
       break;
-    case OperandType::MemAddr:
+    case OperandType::StackMemAddr:
       maybe_set = GetMaybeSet(operand);
       break;
     case OperandType::Register:
@@ -111,7 +139,7 @@ public:
     switch (GetOperandType(tar)) {
     case OperandType::FnAddr:
       MyAssert(false, tar);
-    case OperandType::MemAddr:
+    case OperandType::StackMemAddr:
       PutMaybeSet(tar, maybe_values);
       break;
     case OperandType::Register:
@@ -142,7 +170,7 @@ public:
       MaybeSet maybe_values;
       switch (GetOperandType(src)) {
       case OperandType::FnAddr:
-      case OperandType::MemAddr:
+      case OperandType::StackMemAddr:
         maybe_values = {src};
         break;
       case OperandType::Register:
@@ -155,88 +183,86 @@ public:
 
   void PutMaybeSet(llvm::Value *v, MaybeSet maybe_set) {
     MyAssert(!llvm::isa<llvm::Function>(v), v);
-    auto *p = const_cast<PointsToInfo *>(findPointsToInfo(this, v));
-    if (p == nullptr) {
-      MyAssert(pointsToSets[v].empty());
-      pointsToSets[v] = maybe_set;
-    } else {
-      p->pointsToSets[v] = maybe_set;
+    for (auto &pts : stackFrame) {
+      if (auto it = pts.find(v); it != pts.end()) {
+        it->second = maybe_set;
+        return;
+      }
     }
+    stackFrame.back()[v] = maybe_set;
   }
 
   MaybeSet GetMaybeSet(llvm::Value *v) const {
     MyAssert(!llvm::isa<llvm::Function>(v), v);
-    const auto *p = findPointsToInfo(this, v);
-    if (p == nullptr) {
-      return {};
+    for (auto &pts : stackFrame) {
+      if (auto it = pts.find(v); it != pts.end()) {
+        return it->second;
+      }
     }
-    return p->find(v)->second;
+    return {};
   }
 
   void MergeMaybeSet(llvm::Value *v, const MaybeSet &other) {
     MyAssert(!llvm::isa<llvm::Function>(v), v);
-    auto *p = const_cast<PointsToInfo *>(findPointsToInfo(this, v));
-    if (p == nullptr) {
-      MyAssert(pointsToSets[v].empty());
-      for (auto other_p : other) {
-        pointsToSets[v].insert(other_p);
+    for (auto &pts : stackFrame) {
+      if (auto it = pts.find(v); it != pts.end()) {
+        for (auto ptr : other) {
+          it->second.insert(ptr);
+        }
+        return;
       }
-    } else {
-      for (auto other_p : other) {
-        p->pointsToSets[v].insert(other_p);
-      }
+    }
+    for (auto ptr : other) {
+      stackFrame.back()[v].insert(ptr);
     }
   }
 
   void Merge(const PointsToInfo &other) {
-    MyAssert(father == other.father);
-    for (auto &[v, ptrs] : other.pointsToSets) {
-      if (pointsToSets[v].empty()) {
-        pointsToSets[v] = {}; // add empty MaybeSet (test29.c)
-      }
-      for (auto p : ptrs) {
-        pointsToSets[v].insert(p);
+    MyAssert(stackFrame.size() == other.stackFrame.size());
+    for (int i = 0; i < stackFrame.size(); ++i) {
+      auto &points_to_sets = stackFrame[i];
+      for (auto &[v, ptrs] : other.stackFrame[i]) {
+        if (points_to_sets[v].empty()) {
+          points_to_sets[v] = {}; // add empty MaybeSet (test29.c)
+        }
+        for (auto p : ptrs) {
+          points_to_sets[v].insert(p);
+        }
       }
     }
-  }
-
-private:
-  static const PointsToInfo *findPointsToInfo(const PointsToInfo *cur,
-                                              llvm::Value *v) {
-    while (cur != nullptr &&
-           cur->pointsToSets.find(v) == cur->pointsToSets.end()) {
-      cur = cur->father;
-    }
-    return cur;
   }
 };
 
 inline llvm::raw_ostream &operator<<(llvm::raw_ostream &out,
                                      const PointsToInfo &info) {
   out << "\n";
-  for (const auto [value, pts] : info) {
-    out << "var: ";
-    value->print(out);
-    out << "\npts: ";
-    switch (GetOperandType(value)) {
-    case OperandType::FnAddr:
-      llvm::errs() << "invalid operand type 'fn addr'\n";
-      exit(-1);
-    case OperandType::MemAddr:
-      out << "M ";
-      break;
-    case OperandType::Register:;
-      out << "R ";
-    }
-    out << "size: " << pts.size() << " {";
-    for (auto v : pts) {
-      if (llvm::isa<llvm::Function>(v)) {
-        out << " " << v->getName();
-      } else {
-        v->print(out);
+  int stack_idx = 0;
+  for (auto &point_to_sets : info.stackFrame) {
+    out << "[" << stack_idx++ << "]\n";
+    for (const auto [value, pts] : point_to_sets) {
+      out << "var: ";
+      value->print(out);
+      out << "\npts: ";
+      switch (GetOperandType(value)) {
+      case OperandType::FnAddr:
+        llvm::errs() << "invalid operand type 'fn addr'\n";
+        exit(-1);
+      case OperandType::StackMemAddr:
+        out << "M ";
+        break;
+      case OperandType::Register:;
+        out << "R ";
       }
+      out << "size: " << pts.size() << " {";
+      for (auto v : pts) {
+        if (llvm::isa<llvm::Function>(v)) {
+          out << " " << v->getName();
+        } else {
+          v->print(out);
+        }
+      }
+      out << " }\n";
     }
-    out << " }\n";
   }
   return out;
 }
@@ -254,6 +280,20 @@ public:
   void addCallOutput(unsigned line, llvm::Value *called_operand,
                      PointsToInfo *dfval,
                      std::unordered_set<llvm::Function *> &callset) {
+    switch (GetOperandType(called_operand)) {
+    case OperandType::FnAddr:
+      callOutput[line].insert(called_operand->getName());
+      callset.insert(llvm::cast<llvm::Function>(called_operand));
+      break;
+    case OperandType::StackMemAddr:
+      MyAssert(false, called_operand);
+    case OperandType::Register:
+      for (auto *v : dfval->GetMaybeSet(called_operand)) {
+        callOutput[line].insert(v->getName());
+        callset.insert(llvm::cast<llvm::Function>(v));
+      }
+    }
+    return;
     if (llvm::Function *f = llvm::dyn_cast<llvm::Function>(called_operand)) {
       callOutput[line].insert(f->getName());
       callset.insert(f);
@@ -308,15 +348,32 @@ public:
         ++i;
       }
       if (!f->empty()) {
-        PointsToInfo initval(dfval);
+        PointsToInfo initval(dfval->stackFrame);
+        initval.PushStackFrame();
         DataflowResult<PointsToInfo>::Type result;
         compForwardDataflow(f, &visitor, &result, initval);
-        llvm::errs() << "[Call END]\n";
+
+        auto &child_end = result.rbegin()->second.second;
+        child_end.PopStackFrame();
+        MyAssert(dfval->stackFrame.size() == child_end.stackFrame.size());
+        llvm::errs() << "[father stackframe]\n"
+                     << *dfval;
+        llvm::errs() << "[child stackframe]\n"
+                     << child_end;
+
+        dfval->stackFrame = child_end.stackFrame;
+        llvm::errs() << "[return MaybeSet] {\n";
+        for (auto *ret_v : visitor.returnPts) {
+          ret_v->dump();
+        }
+        llvm::errs() << " }\n";
         dfval->MergeMaybeSet(callInst, visitor.returnPts); // test18.c
       } else if (f->getReturnType()->isPointerTy()) {      // malloc
         dfval->PutMaybeSet(callInst, {});
       }
     }
+
+    llvm::errs() << "[Call END]\n";
   }
 
   void merge(PointsToInfo *dest, const PointsToInfo &src) override {
@@ -337,8 +394,16 @@ public:
       }
     } else if (llvm::CallInst *call_inst = llvm::dyn_cast<llvm::CallInst>(inst); call_inst) {
       if (llvm::IntrinsicInst *intrinsic_inst = llvm::dyn_cast<llvm::IntrinsicInst>(inst)) {
-        if (intrinsic_inst->getIntrinsicID() == llvm::Intrinsic::memcpy) {
+        switch (intrinsic_inst->getIntrinsicID()) {
+        case llvm::Intrinsic::memcpy:
           evalIntrinsicMemcpy(intrinsic_inst, dfval);
+          break;
+        case llvm::Intrinsic::memset:
+          break;
+        default:
+          llvm::errs() << "unimplemented intrinsic\n";
+          intrinsic_inst->dump();
+          exit(-1);
         }
       } else {
         evalCallInst(call_inst, dfval);
@@ -387,7 +452,9 @@ public:
   explicit PointsTo() : ModulePass(ID) {}
   bool runOnModule(llvm::Module &M) override {
     DataflowResult<PointsToInfo>::Type result;
-    PointsToInfo initval(nullptr);
+
+    PointsToInfo initval;
+    initval.PushStackFrame();
     CallOutputMap callOutput;
     PointsToVisitor visitor(callOutput);
     for (auto it = M.rbegin(); it != M.rend(); ++it) {

@@ -3,7 +3,7 @@
 
 OperandType GetOperandType(llvm::Value *v) {
   if (llvm::isa<llvm::AllocaInst>(v) || llvm::isa<llvm::CallInst>(v)) {
-    return OperandType::MemAddr;
+    return OperandType::StackMemAddr;
   } else if (llvm::isa<llvm::LoadInst>(v) || llvm::isa<llvm::GetElementPtrInst>(v) || llvm::isa<llvm::BitCastInst>(v)) {
     return OperandType::Register;
   } else if (llvm::isa<llvm::Function>(v) || llvm::isa<llvm::ConstantPointerNull>(v)) {
@@ -18,6 +18,9 @@ OperandType GetOperandType(llvm::Value *v) {
 // Placement(Load, Alloca) -> Value
 void addRetValues(MaybeSet &returnPts, llvm::Value *ret_value,
                   PointsToInfo *dfval) {
+    returnPts.merge(dfval->GetMaybeRetValue(ret_value));
+  
+  return;
   if (llvm::isa<llvm::Function>(ret_value)) {
     returnPts.insert(ret_value);
   } else {
@@ -39,4 +42,4 @@ void addRetValues(MaybeSet &returnPts, llvm::Value *ret_value,
       addRetValues(returnPts, value, dfval);
     }
   }
- }
+}
