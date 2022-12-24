@@ -83,7 +83,7 @@ int moo(char x, int op1, int op2) {
     return 0;
 }
 
-// 39 : swap_w
+// 39 : swap_ws
 // 40 : plus,minus
 // 49 : make_simple_alias
 // 51 : make_simple_alias

@@ -28,3 +28,6 @@ add_executable(assignment3 ${SOURCE})
 target_link_libraries(assignment3
 	${LLVM_LINK_COMPONENTS}
 	)
+
+  install(TARGETS assignment3 
+  RUNTIME DESTINATION bin)
