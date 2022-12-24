@@ -9,7 +9,7 @@
 			"type": "cppdbg",
 			"request": "launch",
 			"program": "${workspaceFolder}/build/assignment3",
-			"args": ["${workspaceFolder}/test/test20_struct.bc"],
+			"args": ["${workspaceFolder}/test/test30_simple.bc"],
 			"stopAtEntry": false,
 			"cwd": "${workspaceFolder}",
 			"environment": [],

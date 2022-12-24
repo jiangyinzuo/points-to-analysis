@@ -18,3 +18,4 @@ void foo(int a) {
 	void (**xx1)() = &x1;
 	(*goo(a, xx1, &x2))();
 }
+// 19 : plus, minus, goo

@@ -15,6 +15,11 @@ set(LLVM_LINK_COMPONENTS
   LLVMPasses
   )
 
+set(ANALYSIS_VIEW off)
+if(${ANALYSIS_INTERNAL})
+add_definitions(-DANALYSIS_VIEW)
+endif()
+
 message(STATUS "LLVM LIBS : ${LLVM_LINK_COMPONENTS}")
 # Support plugins.
 file(GLOB SOURCE "./*.cpp") 

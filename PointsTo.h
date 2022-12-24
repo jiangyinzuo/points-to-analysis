@@ -14,6 +14,18 @@
 #include <unordered_map>
 #include <unordered_set>
 
+union Operand;
+namespace llvm {
+template <class X>
+bool isa(Operand &val);
+
+template <class X>
+X *dyn_cast(Operand &val);
+
+template <class X>
+X *cast(Operand &val);
+} // namespace llvm
+
 // -------------------------------------------------------------------------------------------------
 // operand type    |  stack mem addr        |  register                      |   fn addr
 // -------------------------------------------------------------------------------------------------
@@ -23,40 +35,131 @@
 //                 |                        |  BitCastInst, CallInst         |   ConstantPointerNull
 // -------------------------------------------------------------------------------------------------
 union Operand {
-  llvm::Value* v; // always > 0
+public:
+  enum class OperandType {
+    StackMemAddr,
+    HeapMemAddr, // emulate malloc
+    Register,
+    FnAddr
+  };
+
+  Operand() : v(nullptr) {}
+  Operand(llvm::Value *v) : v(v) {
+    MyAssert(heap_addr > 0);
+  }
+  explicit Operand(long heap_addr) : heap_addr(heap_addr) {}
+
+  void dump() const {
+    print(llvm::errs());
+  }
+
+  void print(llvm::raw_ostream &out) const {
+    if (heap_addr == 0) {
+      out << "null Operand\n";
+    } else if (isHeapAddr()) {
+      out << "heap addr: " << heap_addr << "\n";
+    } else {
+      v->print(out);
+    }
+  }
+
+  std::string getName() {
+    if (heap_addr == 0) {
+      return "null Operand";
+    } else if (isHeapAddr()) {
+      return "heap addr: " + std::to_string(heap_addr);
+    } else {
+      return v->getName();
+    }
+  }
+
+  bool operator==(const Operand &other) const {
+    return v == other.v;
+  }
+
+  OperandType GetOperandType() const;
+
+  bool isHeapAddr() const {
+    return heap_addr < 0;
+  }
+
+private:
+  friend class std::hash<Operand>;
+  template <class X>
+  friend bool llvm::isa(Operand &val);
+
+  template <class X>
+  friend X *llvm::dyn_cast(Operand &val);
+
+  template <class X>
+  friend X *llvm::cast(Operand &val);
+  friend class Heap;
+
+  llvm::Value *v; // always > 0
   long heap_addr; // always < 0
 };
-using MaybeSet = std::unordered_set<llvm::Value *>;
-enum class OperandType {
-  StackMemAddr,
-  HeapMemAddr, // emulate malloc
-  Register,
-  FnAddr
+
+template <>
+struct std::hash<Operand> {
+  std::size_t operator()(Operand const &s) const noexcept {
+    std::size_t h1 = std::hash<long>{}(s.heap_addr);
+    return h1;
+  }
 };
 
-OperandType GetOperandType(llvm::Value *v);
+namespace llvm {
+template <class X>
+bool isa(Operand &val) {
+  if (val.isHeapAddr()) {
+    return false;
+  }
+  return isa<X>(val.v);
+}
+
+template <class X>
+X *dyn_cast(Operand &val) {
+  if (val.isHeapAddr()) {
+    return static_cast<X *>(nullptr);
+  }
+  return dyn_cast<X>(val.v);
+}
+
+template <class X>
+X *cast(Operand &val) {
+  return cast<X>(val.v);
+}
+} // namespace llvm
+
+using MaybeSet = std::unordered_set<Operand>;
 
 // parammap
 // pamam -> arg
-using ParamMap = std::unordered_map<llvm::Argument *, llvm::Value *>;
+using ParamMap = std::unordered_map<llvm::Argument *, Operand>;
 
-using PointsToSet = std::unordered_map<llvm::Value *, MaybeSet>;
+using PointsToSet = std::unordered_map<Operand, MaybeSet>;
 using StackFrame = std::deque<PointsToSet>;
 
-struct PointsToInfo;
-void addRetValues(MaybeSet &returnPts, llvm::Value *ret_value, PointsToInfo *dfval);
+class MallocEmulator {
+public:
+  MallocEmulator() : malloc_addr(-1) {}
+  Operand Alloc(llvm::CallInst *malloc_call) {
+    if (auto it = h.find(malloc_call); it != h.end()) {
+      return it->second;
+    }
+    Operand result(malloc_addr--);
+    h[malloc_call] = result;
+    return result;
+  }
+
+private:
+  std::unordered_map<llvm::CallInst *, Operand> h;
+  long malloc_addr;
+};
 
 struct PointsToInfo {
 
 public:
   StackFrame stackFrame;
-  PointsToInfo() : stackFrame() {}
-  explicit PointsToInfo(const StackFrame &stack_frame) : stackFrame(stack_frame) {}
-
-  // Inited by DataFlow
-  PointsToInfo(const PointsToInfo &other) {
-    stackFrame = other.stackFrame;
-  }
 
   void PushStackFrame() {
     stackFrame.emplace_back();
@@ -82,67 +185,47 @@ public:
     return stackFrame.back();
   }
 
-  auto end() const { return pointsToSets().cend(); }
-
-  auto find(llvm::Value *v) const {
-    MyAssert(!llvm::isa<llvm::Function>(v), v);
-    for (const auto &pts : stackFrame) {
-      if (auto it = pts.find(v); it != pts.end()) {
-        return it;
-      }
-    }
-    return pointsToSets().end();
-  }
-
-  MaybeSet GetMaybeRetValue(llvm::Value *v) {
-    switch (GetOperandType(v)) {
-    case OperandType::FnAddr:
-      return {v};
-    case OperandType::StackMemAddr:
+  MaybeSet GetMaybeAddr(Operand v) {
+    switch (v.GetOperandType()) {
+    case Operand::OperandType::FnAddr:
       MyAssert(false, v);
-    case OperandType::Register:
-      return GetMaybeSet(v);
-    }
-    return {};
-  }
-  MaybeSet GetMaybeAddr(llvm::Value *v) {
-    switch (GetOperandType(v)) {
-    case OperandType::FnAddr:
-      MyAssert(false, v);
-    case OperandType::StackMemAddr:
+    case Operand::OperandType::StackMemAddr:
+    case Operand::OperandType::HeapMemAddr:
       return {v};
-    case OperandType::Register:
+    case Operand::OperandType::Register:
       return GetMaybeSet(v);
     }
     return {};
   }
 
-  MaybeSet LoadMaybeValuesFromAddr(llvm::Value *operand) {
+  MaybeSet LoadMaybeValuesFromAddr(Operand operand) {
     MaybeSet maybe_set;
-    switch (GetOperandType(operand)) {
-    case OperandType::FnAddr:
+    switch (operand.GetOperandType()) {
+    case Operand::OperandType::FnAddr:
       maybe_set = {operand};
       break;
-    case OperandType::StackMemAddr:
+    case Operand::OperandType::StackMemAddr:
+    case Operand::OperandType::HeapMemAddr:
       maybe_set = GetMaybeSet(operand);
       break;
-    case OperandType::Register:
+    case Operand::OperandType::Register:
       MaybeSet maybe_addrs = GetMaybeSet(operand);
-      for (auto *maybe_addr : maybe_addrs) {
+      for (auto maybe_addr : maybe_addrs) {
         maybe_set.merge(GetMaybeSet(maybe_addr));
       }
     }
     return maybe_set;
   }
 
-  void StoreMaybeValues(llvm::Value *tar, MaybeSet maybe_values) {
-    switch (GetOperandType(tar)) {
-    case OperandType::FnAddr:
+  void StoreMaybeValues(Operand tar, MaybeSet maybe_values) {
+    switch (tar.GetOperandType()) {
+    case Operand::OperandType::FnAddr:
       MyAssert(false, tar);
-    case OperandType::StackMemAddr:
+    case Operand::OperandType::StackMemAddr:
+    case Operand::OperandType::HeapMemAddr:
       PutMaybeSet(tar, maybe_values);
       break;
-    case OperandType::Register:
+    case Operand::OperandType::Register:
       auto maybe_tar_addrs = GetMaybeSet(tar);
       if (maybe_tar_addrs.size() > 1) {
         for (auto maybe_tar_addr : maybe_tar_addrs) {
@@ -156,24 +239,25 @@ public:
           PutMaybeSet(maybe_tar_addr, maybe_values);
         }
       } else {
-        tar->dump();
+        tar.dump();
         llvm::errs() << "T: Maybe Any!\n";
         exit(-1);
       }
     }
   }
 
-  void Store(llvm::Value *src, llvm::Value *tar) {
+  void Store(Operand src, Operand tar) {
     if (llvm::isa<llvm::ConstantPointerNull>(src)) {
       return;
     } else {
       MaybeSet maybe_values;
-      switch (GetOperandType(src)) {
-      case OperandType::FnAddr:
-      case OperandType::StackMemAddr:
+      switch (src.GetOperandType()) {
+      case Operand::OperandType::FnAddr:
+      case Operand::OperandType::StackMemAddr:
+      case Operand::OperandType::HeapMemAddr:
         maybe_values = {src};
         break;
-      case OperandType::Register:
+      case Operand::OperandType::Register:
         maybe_values = GetMaybeSet(src);
       }
 
@@ -181,7 +265,21 @@ public:
     }
   }
 
-  void PutMaybeSet(llvm::Value *v, MaybeSet maybe_set) {
+  // Placement(Load, Alloca) -> Value
+  void AddRetValues(MaybeSet &returnPts, Operand ret_value) const {
+    switch (ret_value.GetOperandType()) {
+    case Operand::OperandType::FnAddr:
+      returnPts.insert(ret_value);
+      return;
+    case Operand::OperandType::StackMemAddr:
+    case Operand::OperandType::HeapMemAddr:
+      MyAssert(false, ret_value);
+    case Operand::OperandType::Register:
+      returnPts.merge(GetMaybeSet(ret_value));
+    }
+  }
+
+  void PutMaybeSet(Operand v, MaybeSet maybe_set) {
     MyAssert(!llvm::isa<llvm::Function>(v), v);
     for (auto &pts : stackFrame) {
       if (auto it = pts.find(v); it != pts.end()) {
@@ -192,7 +290,7 @@ public:
     stackFrame.back()[v] = maybe_set;
   }
 
-  MaybeSet GetMaybeSet(llvm::Value *v) const {
+  MaybeSet GetMaybeSet(Operand v) const {
     MyAssert(!llvm::isa<llvm::Function>(v), v);
     for (auto &pts : stackFrame) {
       if (auto it = pts.find(v); it != pts.end()) {
@@ -202,7 +300,7 @@ public:
     return {};
   }
 
-  void MergeMaybeSet(llvm::Value *v, const MaybeSet &other) {
+  void MergeMaybeSet(Operand v, const MaybeSet &other) {
     MyAssert(!llvm::isa<llvm::Function>(v), v);
     for (auto &pts : stackFrame) {
       if (auto it = pts.find(v); it != pts.end()) {
@@ -217,7 +315,7 @@ public:
     }
   }
 
-  void Merge(const PointsToInfo &other) {
+  void MergeStackFrame(const PointsToInfo &other) {
     MyAssert(stackFrame.size() == other.stackFrame.size());
     for (int i = 0; i < stackFrame.size(); ++i) {
       auto &points_to_sets = stackFrame[i];
@@ -241,24 +339,27 @@ inline llvm::raw_ostream &operator<<(llvm::raw_ostream &out,
     out << "[" << stack_idx++ << "]\n";
     for (const auto [value, pts] : point_to_sets) {
       out << "var: ";
-      value->print(out);
+      value.print(out);
       out << "\npts: ";
-      switch (GetOperandType(value)) {
-      case OperandType::FnAddr:
+      switch (value.GetOperandType()) {
+      case Operand::OperandType::FnAddr:
         llvm::errs() << "invalid operand type 'fn addr'\n";
         exit(-1);
-      case OperandType::StackMemAddr:
-        out << "M ";
+      case Operand::OperandType::StackMemAddr:
+        out << "S ";
         break;
-      case OperandType::Register:;
+      case Operand::OperandType::HeapMemAddr:
+        out << "H ";
+        break;
+      case Operand::OperandType::Register:;
         out << "R ";
       }
       out << "size: " << pts.size() << " {";
       for (auto v : pts) {
         if (llvm::isa<llvm::Function>(v)) {
-          out << " " << v->getName();
+          out << " " << v.getName();
         } else {
-          v->print(out);
+          v.print(out);
         }
       }
       out << " }\n";
@@ -273,42 +374,27 @@ private:
   ParamMap paramMap;
   MaybeSet returnPts;
   CallOutputMap &callOutput;
+  MallocEmulator &mallocEmulator;
 
 public:
-  PointsToVisitor(CallOutputMap &callOutput) : paramMap(), callOutput(callOutput) {}
+  PointsToVisitor(CallOutputMap &callOutput, MallocEmulator &mallocEmulator) : paramMap(), callOutput(callOutput),
+                                                                               mallocEmulator(mallocEmulator) {}
 
-  void addCallOutput(unsigned line, llvm::Value *called_operand,
+  void addCallOutput(unsigned line, Operand called_operand,
                      PointsToInfo *dfval,
                      std::unordered_set<llvm::Function *> &callset) {
-    switch (GetOperandType(called_operand)) {
-    case OperandType::FnAddr:
-      callOutput[line].insert(called_operand->getName());
+    switch (called_operand.GetOperandType()) {
+    case Operand::OperandType::FnAddr:
+      callOutput[line].insert(called_operand.getName());
       callset.insert(llvm::cast<llvm::Function>(called_operand));
       break;
-    case OperandType::StackMemAddr:
+    case Operand::OperandType::StackMemAddr:
+    case Operand::OperandType::HeapMemAddr:
       MyAssert(false, called_operand);
-    case OperandType::Register:
-      for (auto *v : dfval->GetMaybeSet(called_operand)) {
-        callOutput[line].insert(v->getName());
+    case Operand::OperandType::Register:
+      for (auto v : dfval->GetMaybeSet(called_operand)) {
+        callOutput[line].insert(v.getName());
         callset.insert(llvm::cast<llvm::Function>(v));
-      }
-    }
-    return;
-    if (llvm::Function *f = llvm::dyn_cast<llvm::Function>(called_operand)) {
-      callOutput[line].insert(f->getName());
-      callset.insert(f);
-    } else {
-      if (auto callptrs = dfval->find(called_operand);
-          callptrs != dfval->end()) {
-        for (auto it = callptrs->second.begin(); it != callptrs->second.end(); ++it) {
-          if (llvm::Function *f = llvm::dyn_cast<llvm::Function>(*it)) {
-            callOutput[line].insert(f->getName());
-            callset.insert(f);
-          } else {
-            (*it)->dump();
-            addCallOutput(line, *it, dfval, callset);
-          }
-        }
       }
     }
   }
@@ -325,8 +411,9 @@ public:
   }
 
   void evalCallInst(llvm::CallInst *callInst, PointsToInfo *dfval) {
+#ifdef ANALYSIS_VIEW
     llvm::errs() << "[Call BEGIN]\n";
-
+#endif
     // add callOutput
     unsigned line = callInst->getDebugLoc().getLine();
     llvm::Value *called_operand = callInst->getCalledOperand();
@@ -334,8 +421,10 @@ public:
     addCallOutput(line, called_operand, dfval, callset);
 
     for (auto *f : callset) {
+#ifdef ANALYSIS_VIEW
       f->dump();
-      PointsToVisitor visitor(callOutput);
+#endif
+      PointsToVisitor visitor(callOutput, mallocEmulator);
 
       // add Param -> Arg
       int i = 0;
@@ -343,12 +432,20 @@ public:
         llvm::Value *param = callInst->getArgOperand(i);
         if (!param->getType()->isIntegerTy() &&
             !param->getType()->isFloatingPointTy()) {
-          visitor.paramMap[&arg] = param;
+          visitor.paramMap[&arg] = Operand{param};
         }
         ++i;
       }
       if (!f->empty()) {
-        PointsToInfo initval(dfval->stackFrame);
+#ifdef ANALYSIS_VIEW
+        llvm::errs() << "[paramMap]\n";
+        for (auto v : visitor.paramMap) {
+          v.second.dump();
+          llvm::errs() << '\n';
+        }
+#endif
+
+        PointsToInfo initval(*dfval);
         initval.PushStackFrame();
         DataflowResult<PointsToInfo>::Type result;
         compForwardDataflow(f, &visitor, &result, initval);
@@ -356,37 +453,46 @@ public:
         auto &child_end = result.rbegin()->second.second;
         child_end.PopStackFrame();
         MyAssert(dfval->stackFrame.size() == child_end.stackFrame.size());
+#ifdef ANALYSIS_VIEW
         llvm::errs() << "[father stackframe]\n"
                      << *dfval;
         llvm::errs() << "[child stackframe]\n"
                      << child_end;
+#endif
 
         dfval->stackFrame = child_end.stackFrame;
-        llvm::errs() << "[return MaybeSet] {\n";
-        for (auto *ret_v : visitor.returnPts) {
-          ret_v->dump();
+#ifdef ANALYSIS_VIEW
+        llvm::errs() << "[return MaybeSet]\n";
+        for (auto ret_v : visitor.returnPts) {
+          ret_v.dump();
         }
-        llvm::errs() << " }\n";
-        dfval->MergeMaybeSet(callInst, visitor.returnPts); // test18.c
-      } else if (f->getReturnType()->isPointerTy()) {      // malloc
-        dfval->PutMaybeSet(callInst, {});
+        llvm::errs() << "\n";
+#endif
+        dfval->MergeMaybeSet(Operand{callInst}, visitor.returnPts); // test18.c
+      } else if (f->getReturnType()->isPointerTy()) {               // malloc
+        Operand malloc_result = mallocEmulator.Alloc(callInst);
+        dfval->PutMaybeSet(malloc_result, {});
+        dfval->PutMaybeSet(callInst, {malloc_result});
       }
     }
-
+#ifdef ANALYSIS_VIEW
     llvm::errs() << "[Call END]\n";
+#endif
   }
 
   void merge(PointsToInfo *dest, const PointsToInfo &src) override {
-    dest->Merge(src);
+    dest->MergeStackFrame(src);
   }
 
   void compDFVal(llvm::Instruction *inst, PointsToInfo *dfval) override {
     if (llvm::isa<llvm::DbgInfoIntrinsic>(inst)) {
       return;
     }
+#ifdef ANALYSIS_VIEW
     llvm::errs() << (*dfval);
     llvm::errs() << "--------------\n";
     inst->dump();
+#endif
     if (llvm::AllocaInst *alloca = llvm::dyn_cast<llvm::AllocaInst>(inst)) {
       auto atype = alloca->getAllocatedType();
       if (atype->isPointerTy() || atype->isAggregateType()) {
@@ -415,7 +521,7 @@ public:
                                    !ret_value->getType()->isPointerTy())) {
         return;
       }
-      addRetValues(returnPts, ret_value, dfval);
+      dfval->AddRetValues(returnPts, ret_value);
     } else if (llvm::isa<llvm::LoadInst>(inst)) {
       if (!inst->getType()->isPointerTy() && !inst->getType()->isFunctionTy()) {
         return;
@@ -437,10 +543,10 @@ public:
         return;
       }
       if (llvm::Argument *arg = llvm::dyn_cast<llvm::Argument>(value_operand)) {
-        value_operand = paramMap[arg];
-        MyAssert(value_operand != nullptr, store_inst);
+        dfval->Store(paramMap[arg], store_inst->getPointerOperand());
+      } else {
+        dfval->Store(value_operand, store_inst->getPointerOperand());
       }
-      dfval->Store(value_operand, store_inst->getPointerOperand());
     }
   }
 };
@@ -453,13 +559,16 @@ public:
   bool runOnModule(llvm::Module &M) override {
     DataflowResult<PointsToInfo>::Type result;
 
+    MallocEmulator malloc_emulator;
     PointsToInfo initval;
     initval.PushStackFrame();
     CallOutputMap callOutput;
-    PointsToVisitor visitor(callOutput);
+    PointsToVisitor visitor(callOutput, malloc_emulator);
     for (auto it = M.rbegin(); it != M.rend(); ++it) {
       auto &f = *it;
+#ifdef ANALYSIS_VIEW
       f.dump();
+#endif
       if (!f.isIntrinsic() && !f.empty()) {
         for (llvm::Argument &arg : f.args()) {
           if (arg.getType() != nullptr && arg.getType()->isPointerTy()) {
@@ -473,7 +582,10 @@ public:
 
     // Print output
     for (auto &[line, callset] : callOutput) {
-      llvm::errs() << line << " : " << callset.size() << " ";
+      llvm::errs() << line << " : ";
+#ifdef ANALYSIS_VIEW
+      llvm::errs() << callset.size() << " ";
+#endif
       assert(!callset.empty());
       for (auto it = callset.begin(); it != callset.end(); ++it) {
         if (it != callset.begin()) {
